@@ -1,0 +1,13 @@
+<resources>
+    <style name="Base.Theme.Campus" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:colorAccent">#C3A45D</item>
+        <item name="android:navigationBarColor">#F8F6F0</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowBackground">@drawable/campus_launch_background</item>
+    </style>
+    <style name="Theme.Campus" parent="Base.Theme.Campus" />
+</resources>

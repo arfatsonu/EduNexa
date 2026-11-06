@@ -1,0 +1,46 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userProfileExists() {
+      return signedIn() &&
+        firestore.exists(/databases/(default)/documents/users/$(request.auth.uid));
+    }
+
+    function me() {
+      return firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function sameSchool(schoolId) {
+      return userProfileExists() &&
+        me().active == true && me().role in ['admin', 'teacher', 'student'] && request.auth.token.get('platformOwner', false) != true &&
+        me().get('portalDisabled', false) != true &&
+        me().schoolId == schoolId;
+    }
+
+    function isActiveTeacher() {
+      return me().role == 'teacher' &&
+        me().profileId != null &&
+        firestore.exists(/databases/(default)/documents/schools/$(me().schoolId)/teachers/$(me().profileId)) &&
+        firestore.get(/databases/(default)/documents/schools/$(me().schoolId)/teachers/$(me().profileId)).data.status == 'Active';
+    }
+
+    match /schools/{schoolId}/diary/{diaryId}/{fileName} {
+      allow read: if sameSchool(schoolId);
+
+      allow create, update: if sameSchool(schoolId) &&
+        isActiveTeacher() &&
+        request.resource.size < 2 * 1024 * 1024;
+
+      allow delete: if sameSchool(schoolId) && isActiveTeacher();
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

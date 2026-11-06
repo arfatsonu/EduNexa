@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.Campus" parent="Base.Theme.Campus">
+        <item name="android:windowSplashScreenBackground">#F7F9FC</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/campus_launcher_foreground</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">#F7F9FC</item>
+    </style>
+</resources>

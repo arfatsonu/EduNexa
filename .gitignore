@@ -1,0 +1,10 @@
+# Local build output and private signing configuration.
+.gradle/
+**/build/
+local.properties
+keystore.properties
+*.jks
+*.p12
+# Never commit tenant Firebase configuration or private release keys.
+app/google-services.json
+keystore/*release*

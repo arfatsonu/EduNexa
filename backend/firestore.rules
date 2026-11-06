@@ -1,0 +1,591 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function profileExists() {
+      return signedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function me() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function activeUser() {
+      return profileExists() && me().active == true && me().get('portalDisabled', false) != true;
+    }
+
+    // Operational history is append-only until its documented 100-entry retention cap.
+    // Updates from older app versions may preserve history but cannot erase or rewrite it.
+    function validHistoryEvent(event, after) {
+      return event is map && event.keys().hasOnly(['id','at','actorUid','actorName','role','action','target','fields']) &&
+        event.actorUid == request.auth.uid && after.lastEditedByUid == request.auth.uid &&
+        event.id is string && event.id.size() == 36 && event.at is string &&
+        event.actorName is string && event.role == me().role &&
+        event.action is string && event.action.size() <= 80 &&
+        event.target is string && event.target.size() <= 160 &&
+        event.fields is list && event.fields.size() <= 50;
+    }
+    function operationalHistory(before, after) {
+      let old = before.get('activityHistory', []);
+      let next = after.get('activityHistory', []);
+      return old is list && next is list && (next == old ||
+        (next.size() > 0 && next.size() <= 100 &&
+        validHistoryEvent(next[next.size() - 1], after) &&
+        ((old.size() < 100 && next.size() == old.size() + 1 &&
+          next.removeAll([next[next.size() - 1]]) == old) ||
+         (old.size() == 100 && next.size() == 100 &&
+          next.removeAll([next[99]]) == old.removeAll([old[0]])))));
+    }
+    function platformOwner() {
+      return signedIn() && request.auth.token.get('platformOwner', false) == true &&
+        activeUser() && me().role in ['owner', 'admin'];
+    }
+    function newOwnerSchool(schoolId) {
+      let school = getAfter(/databases/$(database)/documents/schools/$(schoolId)).data;
+      return platformOwner() && school.createdByOwnerUid == request.auth.uid && school.createdAt == request.time;
+    }
+    function validOwnerSchoolCreate(schoolId) {
+      let data = request.resource.data;
+      let admin = getAfter(/databases/$(database)/documents/users/$(data.adminUid)).data;
+      return platformOwner() && data.keys().hasOnly(['name','settings','portalAccessEnabled','createdByOwnerUid','adminUid','createdAt']) &&
+        data.createdByOwnerUid == request.auth.uid && data.createdAt == request.time && data.portalAccessEnabled == true &&
+        data.adminUid is string && data.adminUid != request.auth.uid &&
+        data.settings.keys().hasOnly(['schoolName','campusName','schoolShortName']) &&
+        data.settings.schoolName is string && data.settings.schoolName.size() >= 2 && data.settings.schoolName.size() <= 150 &&
+        data.settings.campusName is string && data.settings.campusName.size() >= 2 && data.settings.campusName.size() <= 150 &&
+        data.settings.schoolShortName is string && data.settings.schoolShortName.size() >= 2 && data.settings.schoolShortName.size() <= 12 &&
+        admin.schoolId == schoolId && admin.role == 'admin' && admin.active == true && admin.portalDisabled == false &&
+        admin.createdByOwnerUid == request.auth.uid && admin.createdAt == request.time;
+    }
+    // Owner may edit public school identity, never academic data or role links.
+    function ownerSchoolProfileEdit() {
+      let data = request.resource.data;
+      let settings = data.settings;
+      return platformOwner() &&
+        data.diff(resource.data).affectedKeys().hasOnly(['name','settings','ownerProfileUpdatedBy','ownerProfileUpdatedAt']) &&
+        data.ownerProfileUpdatedBy == request.auth.uid && data.ownerProfileUpdatedAt == request.time &&
+        settings is map && settings.diff(resource.data.get('settings', {})).affectedKeys().hasOnly([
+          'schoolName','campusName','schoolShortName','tagline','affiliation','principalName','email','phone','whatsapp','address','schoolLogo']) &&
+        settings.schoolName is string && settings.schoolName.size() > 0 && settings.schoolName.size() <= 200 && data.name == settings.schoolName &&
+        settings.campusName is string && settings.campusName.size() > 0 && settings.campusName.size() <= 200 &&
+        settings.schoolShortName is string && settings.schoolShortName.matches('[A-Z0-9]{2,12}') &&
+        settings.get('address', '') is string && settings.get('address', '').size() <= 1000 &&
+        settings.get('schoolLogo', '') is string && settings.get('schoolLogo', '').size() <= 120000 &&
+        (settings.get('schoolLogo', '') == '' || settings.schoolLogo.matches('data:image/png;base64,.*'));
+    }
+    function ownerAdminIdentityEdit(userId) {
+      let data = request.resource.data;
+      return platformOwner() && userId != request.auth.uid && resource.data.role == 'admin' &&
+        resource.data.active == true && resource.data.get('portalDisabled', false) != true &&
+        exists(/databases/$(database)/documents/schools/$(resource.data.schoolId)) &&
+        data.diff(resource.data).affectedKeys().hasOnly(['name','email','ownerAccountUpdatedBy','ownerAccountUpdatedAt']) &&
+        data.ownerAccountUpdatedBy == request.auth.uid && data.ownerAccountUpdatedAt == request.time &&
+        data.name is string && data.name.size() >= 2 && data.name.size() <= 150 &&
+        data.email is string && data.email.size() <= 200 && data.email.matches('[^ @]+@[^ @]+[.][^ @]+');
+    }
+    function schoolEnabled(schoolId) {
+      return get(/databases/$(database)/documents/schools/$(schoolId)).data.get('portalAccessEnabled', true) == true;
+    }
+    function sameSchool(schoolId) {
+      return activeUser() && me().schoolId == schoolId && schoolEnabled(schoolId);
+    }
+
+    function isAdmin() {
+      return signedIn() && me().role == 'admin' && request.auth.token.get('platformOwner', false) != true && activeUser();
+    }
+
+    function isTeacher() {
+      return activeUser() && me().role == 'teacher';
+    }
+
+    function isStudent() {
+      return activeUser() && me().role == 'student';
+    }
+
+    function teacherProfileExists(schoolId) {
+      return isTeacher() &&
+        me().profileId != null &&
+        exists(/databases/$(database)/documents/schools/$(schoolId)/teachers/$(me().profileId));
+    }
+
+    function myTeacherProfile(schoolId) {
+      return get(/databases/$(database)/documents/schools/$(schoolId)/teachers/$(me().profileId)).data;
+    }
+
+    // Missing documents contain no school data. Allow scoped teachers to read
+    // absence before an atomic create; existing documents still use normal scope checks.
+    function activeSchoolTeacher(schoolId) {
+      return sameSchool(schoolId) && teacherProfileExists(schoolId) &&
+        myTeacherProfile(schoolId).status == 'Active';
+    }
+
+    function teacherCanManageAttendance(schoolId, data) {
+      return sameSchool(schoolId) &&
+        teacherProfileExists(schoolId) &&
+        myTeacherProfile(schoolId).status == 'Active' &&
+        myTeacherProfile(schoolId).inchargeClassId == data.classId &&
+        myTeacherProfile(schoolId).inchargeSectionId == data.sectionId;
+    }
+
+    function teacherAttendanceSession(schoolId, data) {
+      return myTeacherProfile(schoolId).get('inchargeAcademicSession', '') in ['', data.academicSessionId] &&
+        myTeacherProfile(schoolId).get('activeAcademicSessionId', '') in ['', data.academicSessionId];
+    }
+
+    function teacherHasSubjectAccess(schoolId, data) {
+      return sameSchool(schoolId) &&
+        teacherProfileExists(schoolId) &&
+        myTeacherProfile(schoolId).status == 'Active' &&
+        myTeacherProfile(schoolId).keys().hasAny(['subjectAccessKeys']) &&
+        data.accessKey == data.classId + '__' + data.sectionId + '__' + data.subjectId &&
+        data.accessKey in myTeacherProfile(schoolId).subjectAccessKeys;
+    }
+
+    function teacherCanCheckHomework(schoolId, data) {
+      return teacherHasSubjectAccess(schoolId, data) ||
+        (
+          sameSchool(schoolId) &&
+          teacherProfileExists(schoolId) &&
+          myTeacherProfile(schoolId).status == 'Active' &&
+          myTeacherProfile(schoolId).inchargeClassId == data.classId &&
+          myTeacherProfile(schoolId).inchargeSectionId == data.sectionId
+        );
+    }
+
+    function teacherIsInchargeFor(schoolId, data) {
+      return sameSchool(schoolId) &&
+        teacherProfileExists(schoolId) &&
+        myTeacherProfile(schoolId).status == 'Active' &&
+        myTeacherProfile(schoolId).inchargeClassId == data.classId &&
+        myTeacherProfile(schoolId).inchargeSectionId == data.sectionId;
+    }
+
+    function teacherCanReadAssessment(schoolId, data) {
+      return sameSchool(schoolId) &&
+        teacherProfileExists(schoolId) &&
+        myTeacherProfile(schoolId).status == 'Active' &&
+        (
+          (
+            data.keys().hasAny(['teacherId']) &&
+            data.teacherId == me().profileId
+          ) ||
+          (
+            data.keys().hasAny(['testTeacherId']) &&
+            data.testTeacherId == me().profileId
+          ) ||
+          teacherIsInchargeFor(schoolId, data)
+        );
+    }
+
+    function teacherOwnsTest(schoolId, data) {
+      let testPath = /databases/$(database)/documents/schools/$(schoolId)/tests/$(data.testId);
+      return exists(testPath) &&
+        get(testPath).data.teacherId == me().profileId &&
+        get(testPath).data.classId == data.classId &&
+        get(testPath).data.sectionId == data.sectionId &&
+        get(testPath).data.subjectId == data.subjectId &&
+        get(testPath).data.academicSessionId == data.academicSessionId;
+    }
+
+    function resultUnlocked(schoolId, testId) {
+      return !exists(/databases/$(database)/documents/schools/$(schoolId)/resultWorkflow/$(testId)) ||
+        (get(/databases/$(database)/documents/schools/$(schoolId)/resultWorkflow/$(testId)).data.get('isLocked', false) != true &&
+        get(/databases/$(database)/documents/schools/$(schoolId)/resultWorkflow/$(testId)).data.get('isPublished', false) != true);
+    }
+
+    function validHomeworkFeedback(schoolId, data) {
+      let source = getAfter(/databases/$(database)/documents/schools/$(schoolId)/homeworkSessions/$(data.homeworkSessionId)).data;
+      return activeSchoolTeacher(schoolId) &&
+        teacherCanCheckHomework(schoolId, source) &&
+        source.checkedByTeacherId == me().profileId &&
+        data.keys().hasOnly(['schoolId', 'studentId', 'homeworkSessionId', 'diaryId', 'academicSessionId', 'checkedAt', 'recordIndex', 'record', 'context']) &&
+        data.schoolId == schoolId && data.diaryId == source.diaryId &&
+        data.academicSessionId == source.academicSessionId &&
+        data.checkedAt == source.checkedAt &&
+        data.recordIndex is int && data.recordIndex >= 0 &&
+        data.recordIndex < source.records.size() &&
+        data.record == source.records[data.recordIndex] &&
+        data.record.studentId == data.studentId &&
+        data.context == {'academicSession': source.get('academicSession', ''), 'classId': source.get('classId', ''), 'className': source.get('className', ''), 'sectionId': source.get('sectionId', ''), 'section': source.get('section', ''), 'subjectId': source.get('subjectId', ''), 'subject': source.get('subject', ''), 'date': source.get('date', '')};
+    }
+
+    function isOwnStudentProfile(schoolId, studentId) {
+      return sameSchool(schoolId) &&
+        me().role == 'student' &&
+        me().profileId == studentId;
+    }
+
+    function isOwnTeacherProfile(schoolId, teacherId) {
+      return sameSchool(schoolId) &&
+        me().role == 'teacher' &&
+        me().profileId == teacherId;
+    }
+
+    match /schools/{schoolId} {
+      allow read: if platformOwner() || (activeUser() && me().schoolId == schoolId);
+      allow create: if validOwnerSchoolCreate(schoolId) || (isAdmin() && me().schoolId == schoolId &&
+        !request.resource.data.keys().hasAny(['portalAccessEnabled','accessUpdatedBy','accessUpdatedAt','accessHistory']));
+      allow update: if operationalHistory(resource.data, request.resource.data) && (ownerSchoolProfileEdit() || (isAdmin() && sameSchool(schoolId) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['portalAccessEnabled','accessUpdatedBy','accessUpdatedAt','accessHistory','createdByOwnerUid','adminUid','createdAt','ownerProfileUpdatedBy','ownerProfileUpdatedAt'])) ||
+        (platformOwner() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['portalAccessEnabled','accessUpdatedBy','accessUpdatedAt','accessHistory']) &&
+        request.resource.data.portalAccessEnabled is bool &&
+        request.resource.data.accessUpdatedBy == request.auth.uid &&
+        request.resource.data.accessUpdatedAt == request.time &&
+        request.resource.data.accessHistory is list && request.resource.data.accessHistory.size() <= 100 &&
+        (schoolId != me().get('schoolId', '') || request.resource.data.portalAccessEnabled == true)));
+      allow delete: if false;
+
+      match /academicConfig/{configId} {
+        allow create: if newOwnerSchool(schoolId) && (
+          (configId == 'current' && request.resource.data == {'classes':[], 'sections':[], 'sessions':[], 'subjects':[], 'teacherAssignments':[], 'classSubjectAssignments':[], 'students':[], 'teachers':[]}) ||
+          (configId == 'registrationCounter' && request.resource.data.keys().hasOnly(['lastAdmissionNumber','updatedAt']) && request.resource.data.lastAdmissionNumber == 0 && request.resource.data.updatedAt == request.time) ||
+          (configId == 'teacherRegistrationCounter' && request.resource.data.keys().hasOnly(['lastEmployeeNumber','updatedAt']) && request.resource.data.lastEmployeeNumber == 0 && request.resource.data.updatedAt == request.time));
+        allow get: if platformOwner() && configId in ["current","registrationCounter","teacherRegistrationCounter"];
+        allow read, create, update, delete:
+          if isAdmin() && sameSchool(schoolId);
+      }
+
+      match /students/{studentId} {
+        allow read: if (isAdmin() && sameSchool(schoolId)) ||
+          isOwnStudentProfile(schoolId, studentId);
+        allow create: if isAdmin() && sameSchool(schoolId) && operationalHistory({}, request.resource.data);
+        allow update: if isAdmin() && sameSchool(schoolId) && operationalHistory(resource.data, request.resource.data);
+        allow delete: if isAdmin() && sameSchool(schoolId);
+      }
+
+      match /teachers/{teacherId} {
+        allow read: if (isAdmin() && sameSchool(schoolId)) ||
+          isOwnTeacherProfile(schoolId, teacherId);
+        allow create: if isAdmin() && sameSchool(schoolId) && operationalHistory({}, request.resource.data);
+        allow update: if isAdmin() && sameSchool(schoolId) && operationalHistory(resource.data, request.resource.data);
+        allow delete: if isAdmin() && sameSchool(schoolId);
+      }
+
+      match /attendance/{attendanceId} {
+        allow get: if activeSchoolTeacher(schoolId) &&
+          !exists(/databases/$(database)/documents/schools/$(schoolId)/attendance/$(attendanceId));
+        allow read: if (isAdmin() && sameSchool(schoolId)) ||
+          (isTeacher() && teacherCanManageAttendance(schoolId, resource.data)) ||
+          (isStudent() && sameSchool(schoolId) &&
+            resource.data.studentId == me().profileId);
+
+        allow create: if operationalHistory({}, request.resource.data) && ((isAdmin() && sameSchool(schoolId)) ||
+          (teacherCanManageAttendance(schoolId, request.resource.data) &&
+            teacherAttendanceSession(schoolId, request.resource.data) &&
+            request.resource.data.status in ['Present', 'Absent', 'Leave', 'Late']));
+
+        allow update: if operationalHistory(resource.data, request.resource.data) && ((isAdmin() && sameSchool(schoolId)) ||
+          (
+            teacherCanManageAttendance(schoolId, resource.data) &&
+            teacherCanManageAttendance(schoolId, request.resource.data) &&
+            teacherAttendanceSession(schoolId, request.resource.data) &&
+            request.resource.data.status in ['Present', 'Absent', 'Leave', 'Late'] &&
+            request.resource.data.studentId == resource.data.studentId &&
+            request.resource.data.classId == resource.data.classId &&
+            request.resource.data.sectionId == resource.data.sectionId &&
+            request.resource.data.academicSessionId == resource.data.academicSessionId &&
+            request.resource.data.attendanceDate == resource.data.attendanceDate
+          ));
+
+        allow delete: if isAdmin() && sameSchool(schoolId);
+      }
+
+      match /diaryEntries/{diaryId} {
+        allow get: if activeSchoolTeacher(schoolId) &&
+          !exists(/databases/$(database)/documents/schools/$(schoolId)/diaryEntries/$(diaryId));
+        allow read: if (isAdmin() && sameSchool(schoolId)) ||
+          (
+            isTeacher() &&
+            sameSchool(schoolId) &&
+            (
+              resource.data.teacherId == me().profileId ||
+              teacherIsInchargeFor(schoolId, resource.data)
+            )
+          ) ||
+          (
+            isStudent() &&
+            sameSchool(schoolId) &&
+            me().profileId in resource.data.studentIds
+          );
+
+        allow create: if
+          (
+            teacherHasSubjectAccess(schoolId, request.resource.data) &&
+            request.resource.data.teacherId == me().profileId
+          );
+
+        allow update: if
+          (
+            teacherHasSubjectAccess(schoolId, request.resource.data) &&
+            resource.data.teacherId == me().profileId &&
+            request.resource.data.teacherId == me().profileId &&
+            request.resource.data.classId == resource.data.classId &&
+            request.resource.data.sectionId == resource.data.sectionId &&
+            request.resource.data.subjectId == resource.data.subjectId &&
+            request.resource.data.academicSessionId == resource.data.academicSessionId
+          );
+
+        allow delete: if
+          (
+            teacherHasSubjectAccess(schoolId, resource.data) &&
+            resource.data.teacherId == me().profileId
+          );
+      }
+
+      match /homeworkSessions/{homeworkId} {
+        allow get: if activeSchoolTeacher(schoolId) &&
+          !exists(/databases/$(database)/documents/schools/$(schoolId)/homeworkSessions/$(homeworkId));
+        allow read: if (isAdmin() && sameSchool(schoolId)) ||
+          (
+            isTeacher() &&
+            sameSchool(schoolId) &&
+            (
+              resource.data.checkedByTeacherId == me().profileId ||
+              teacherIsInchargeFor(schoolId, resource.data)
+            )
+          );
+
+        allow create: if
+          (
+            teacherCanCheckHomework(schoolId, request.resource.data) &&
+            request.resource.data.checkedByTeacherId == me().profileId
+          );
+
+        allow update: if
+          (
+            teacherCanCheckHomework(schoolId, request.resource.data) &&
+            request.resource.data.checkedByTeacherId == me().profileId &&
+            request.resource.data.classId == resource.data.classId &&
+            request.resource.data.sectionId == resource.data.sectionId &&
+            request.resource.data.subjectId == resource.data.subjectId &&
+            request.resource.data.academicSessionId == resource.data.academicSessionId &&
+            request.resource.data.diaryId == resource.data.diaryId
+          );
+
+        allow delete: if false;
+      }
+
+      // Personal derived feedback is written atomically with its class homework source.
+      // Students never receive the class-wide records list.
+      match /homeworkFeedback/{feedbackId} {
+        allow read: if (isAdmin() && sameSchool(schoolId)) ||
+          (isStudent() && sameSchool(schoolId) && resource.data.studentId == me().profileId);
+        allow create, update: if validHomeworkFeedback(schoolId, request.resource.data);
+        allow delete: if false;
+      }
+
+      match /tests/{testId} {
+        allow get: if activeSchoolTeacher(schoolId) &&
+          !exists(/databases/$(database)/documents/schools/$(schoolId)/tests/$(testId));
+        allow read: if (isAdmin() && sameSchool(schoolId)) ||
+          (isTeacher() && teacherCanReadAssessment(schoolId, resource.data)) ||
+          (
+            isStudent() &&
+            sameSchool(schoolId) &&
+            me().profileId in resource.data.studentIds
+          );
+
+        allow create: if
+          (
+            teacherHasSubjectAccess(schoolId, request.resource.data) &&
+            request.resource.data.teacherId == me().profileId
+          );
+
+        allow update: if
+          (
+            teacherHasSubjectAccess(schoolId, request.resource.data) &&
+            resource.data.teacherId == me().profileId &&
+            request.resource.data.teacherId == me().profileId &&
+            request.resource.data.classId == resource.data.classId &&
+            request.resource.data.sectionId == resource.data.sectionId &&
+            request.resource.data.subjectId == resource.data.subjectId &&
+            request.resource.data.academicSessionId == resource.data.academicSessionId &&
+            resultUnlocked(schoolId, testId)
+          );
+
+        allow delete: if
+          (
+            teacherHasSubjectAccess(schoolId, resource.data) &&
+            resource.data.teacherId == me().profileId &&
+            resultUnlocked(schoolId, testId)
+          );
+      }
+
+      match /marks/{markId} {
+        allow read: if (isAdmin() && sameSchool(schoolId)) ||
+          (isTeacher() && teacherCanReadAssessment(schoolId, resource.data)) ||
+          (isStudent() && sameSchool(schoolId) && resource.data.studentId == me().profileId);
+
+        allow create: if
+          (
+            teacherHasSubjectAccess(schoolId, request.resource.data) &&
+            teacherOwnsTest(schoolId, request.resource.data) &&
+            request.resource.data.testTeacherId == me().profileId &&
+            resultUnlocked(schoolId, request.resource.data.testId)
+          );
+
+        allow update: if
+          (
+            teacherHasSubjectAccess(schoolId, request.resource.data) &&
+            teacherOwnsTest(schoolId, request.resource.data) &&
+            resource.data.testTeacherId == me().profileId &&
+            request.resource.data.testTeacherId == me().profileId &&
+            request.resource.data.testId == resource.data.testId &&
+            request.resource.data.studentId == resource.data.studentId &&
+            request.resource.data.classId == resource.data.classId &&
+            request.resource.data.sectionId == resource.data.sectionId &&
+            request.resource.data.subjectId == resource.data.subjectId &&
+            resultUnlocked(schoolId, resource.data.testId)
+          );
+
+        allow delete: if
+          (
+            teacherHasSubjectAccess(schoolId, resource.data) &&
+            teacherOwnsTest(schoolId, resource.data) &&
+            resource.data.testTeacherId == me().profileId &&
+            resultUnlocked(schoolId, resource.data.testId)
+          );
+      }
+
+      match /publishedResults/{resultId} {
+        allow read: if (isAdmin() && sameSchool(schoolId)) ||
+          (isTeacher() && teacherCanReadAssessment(schoolId, resource.data)) ||
+          (
+            isStudent() &&
+            sameSchool(schoolId) &&
+            resource.data.studentId == me().profileId
+          );
+
+        allow create, update, delete: if false;
+      }
+
+      match /examSessions/{sessionId} {
+        allow read: if sameSchool(schoolId);
+        allow create, update, delete: if isAdmin() && sameSchool(schoolId);
+      }
+
+      match /resultWorkflow/{testId} {
+        allow read: if (isAdmin() && sameSchool(schoolId)) ||
+          (isTeacher() && sameSchool(schoolId)) ||
+          (
+            isStudent() &&
+            sameSchool(schoolId) &&
+            resource.data.isPublished == true
+          );
+
+        allow create, update: if sameSchool(schoolId) && (isAdmin() || isTeacher());
+        allow delete: if isAdmin() && sameSchool(schoolId);
+      }
+
+      match /fees/{feeId} {
+        allow read: if (isAdmin() && sameSchool(schoolId)) ||
+          (
+            isTeacher() &&
+            teacherIsInchargeFor(schoolId, resource.data)
+          ) ||
+          (
+            isStudent() &&
+            sameSchool(schoolId) &&
+            resource.data.studentId == me().profileId
+          );
+
+        allow create: if isAdmin() && sameSchool(schoolId) && operationalHistory({}, request.resource.data);
+        allow update: if isAdmin() && sameSchool(schoolId) && operationalHistory(resource.data, request.resource.data);
+        allow delete: if isAdmin() && sameSchool(schoolId);
+      }
+
+      match /notifications/{notificationId} {
+        allow read: if (isAdmin() && sameSchool(schoolId)) ||
+          (
+            sameSchool(schoolId) &&
+            me().profileId != null &&
+            me().profileId in resource.data.recipientIds
+          );
+
+        allow create, update, delete: if isAdmin() && sameSchool(schoolId);
+      }
+
+      match /notificationReads/{readId} {
+        allow read: if (isAdmin() && sameSchool(schoolId)) ||
+          (
+            sameSchool(schoolId) &&
+            me().profileId != null &&
+            resource.data.userId == me().profileId
+          );
+
+        allow create: if (isAdmin() && sameSchool(schoolId)) ||
+          (
+            sameSchool(schoolId) &&
+            me().profileId != null &&
+            request.resource.data.userId == me().profileId &&
+            exists(
+              /databases/$(database)/documents/schools/$(schoolId)/notifications/$(request.resource.data.notificationId)
+            ) &&
+            me().profileId in get(
+              /databases/$(database)/documents/schools/$(schoolId)/notifications/$(request.resource.data.notificationId)
+            ).data.recipientIds
+          );
+
+        allow update: if (isAdmin() && sameSchool(schoolId)) ||
+          (
+            sameSchool(schoolId) &&
+            me().profileId != null &&
+            resource.data.userId == me().profileId &&
+            request.resource.data.userId == resource.data.userId &&
+            request.resource.data.notificationId == resource.data.notificationId
+          );
+
+        allow delete: if isAdmin() && sameSchool(schoolId);
+      }
+
+      match /timetables/{timetableId} {
+        allow read: if sameSchool(schoolId);
+        allow create, update, delete: if isAdmin() && sameSchool(schoolId);
+      }
+
+      match /studentTeacherMessages/{messageId} {
+        allow read: if sameSchool(schoolId) && (isAdmin() || (isTeacher() && resource.data.teacherId == me().profileId) || (isStudent() && resource.data.studentId == me().profileId));
+        allow create: if sameSchool(schoolId) && isStudent() && request.resource.data.studentId == me().profileId;
+        allow update: if sameSchool(schoolId) && ((isTeacher() && resource.data.teacherId == me().profileId) || (isStudent() && resource.data.studentId == me().profileId) || isAdmin());
+        allow delete: if isAdmin() && sameSchool(schoolId);
+      }
+    }
+
+    match /users/{userId} {
+      allow list: if platformOwner() && resource.data.role == 'admin' && request.query.limit <= 20;
+      allow update: if ownerAdminIdentityEdit(userId);
+      allow get: if platformOwner() && (!exists(/databases/$(database)/documents/users/$(userId)) || resource.data.role == 'admin');
+      allow create: if platformOwner() && request.resource.data.keys().hasOnly(['name','email','role','schoolId','active','portalDisabled','createdByOwnerUid','createdAt']) &&
+        request.resource.data.role == 'admin' && request.resource.data.active == true && request.resource.data.portalDisabled == false &&
+        request.resource.data.createdByOwnerUid == request.auth.uid && request.resource.data.createdAt == request.time &&
+        newOwnerSchool(request.resource.data.schoolId) && getAfter(/databases/$(database)/documents/schools/$(request.resource.data.schoolId)).data.adminUid == userId;
+      allow read: if signedIn() && request.auth.uid == userId;
+
+      allow read: if isAdmin() &&
+        resource.data.schoolId == me().schoolId;
+
+      allow create: if isAdmin() &&
+        request.resource.data.schoolId == me().schoolId && request.resource.data.role in ['admin', 'teacher', 'student'];
+
+      allow update: if isAdmin() &&
+        resource.data.schoolId == me().schoolId &&
+        request.resource.data.schoolId == resource.data.schoolId && resource.data.role != 'owner' && request.resource.data.role in ['admin', 'teacher', 'student'] &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['ownerAccountUpdatedBy','ownerAccountUpdatedAt']);
+
+      allow delete: if isAdmin() &&
+        resource.data.schoolId == me().schoolId &&
+        userId != request.auth.uid && resource.data.role != 'owner';
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
